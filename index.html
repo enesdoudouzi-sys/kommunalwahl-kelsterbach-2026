@@ -1,14 +1,31 @@
-// ===============================
-// Kelsterbach – Stimmungsbild
-// Frontend + Backend in EINEM File
-// ===============================
-
 import express from "express";
 import sqlite3 from "sqlite3";
 import crypto from "crypto";
 
 const app = express();
 app.use(express.json());
+
+/* ===============================
+   RATE LIMITING (soft)
+================================ */
+const rateLimit = {};
+const RATE_LIMIT = 20;          // max Requests
+const RATE_WINDOW = 60 * 1000;  // pro Minute
+
+app.use((req, res, next) => {
+  const ip = req.ip;
+  const now = Date.now();
+
+  rateLimit[ip] = rateLimit[ip] || [];
+  rateLimit[ip] = rateLimit[ip].filter(ts => now - ts < RATE_WINDOW);
+
+  if (rateLimit[ip].length >= RATE_LIMIT) {
+    return res.status(429).json({ error: "rate limit" });
+  }
+
+  rateLimit[ip].push(now);
+  next();
+});
 
 /* ===============================
    DATABASE
@@ -32,7 +49,15 @@ CREATE TABLE IF NOT EXISTS themes (
 )`);
 
 /* ===============================
-   HELPERS
+   AUTO CLEANUP (DSGVO)
+================================ */
+const MAX_AGE = 180 * 24 * 60 * 60 * 1000; // 180 Tage
+const cutoff = Date.now() - MAX_AGE;
+db.run("DELETE FROM votes WHERE created_at < ?", [cutoff]);
+db.run("DELETE FROM themes WHERE created_at < ?", [cutoff]);
+
+/* ===============================
+   HELPERS & WHITELISTS
 ================================ */
 function makeHash(req){
   return crypto
@@ -41,12 +66,31 @@ function makeHash(req){
     .digest("hex");
 }
 
+function sinceFromRange(range){
+  if(range==="7d") return Date.now() - 7*24*60*60*1000;
+  if(range==="30d") return Date.now() - 30*24*60*60*1000;
+  return 0;
+}
+
+const ALLOWED_CHOICES = [
+  "CDU","SPD","FDP","Die Linke","EUK",
+  "Freie Wähler","WIK + FNK","HAK","Unentschlossen"
+];
+
+const ALLOWED_THEMES = [
+  "Wohnraum","Verkehr","Radwege","ÖPNV"
+];
+
 /* ===============================
    API
 ================================ */
+
+// Vote (1x / 24h)
 app.post("/api/vote",(req,res)=>{
   const { choice } = req.body;
-  if(!choice) return res.status(400).end();
+  if(!ALLOWED_CHOICES.includes(choice)){
+    return res.status(400).json({error:"invalid choice"});
+  }
 
   const hash = makeHash(req);
   const since = Date.now() - 24*60*60*1000;
@@ -65,23 +109,49 @@ app.post("/api/vote",(req,res)=>{
   );
 });
 
+// Results (time filter)
 app.get("/api/results",(req,res)=>{
-  db.all(
-    "SELECT choice, COUNT(*) as count FROM votes GROUP BY choice",
-    (err,rows)=>res.json(rows)
+  const range = req.query.range || "all";
+  const since = sinceFromRange(range);
+
+  const sql = since
+    ? "SELECT choice, COUNT(*) as count FROM votes WHERE created_at>=? GROUP BY choice"
+    : "SELECT choice, COUNT(*) as count FROM votes GROUP BY choice";
+
+  const params = since ? [since] : [];
+  db.all(sql, params, (err,rows)=>res.json(rows));
+});
+
+// Meta (Transparenz)
+app.get("/api/meta",(req,res)=>{
+  db.get(
+    "SELECT COUNT(*) as total, MIN(created_at) as first, MAX(created_at) as last FROM votes",
+    (err,row)=>{
+      res.json({
+        votes_total: row.total,
+        first_vote: row.first ? new Date(row.first).toISOString().slice(0,10) : null,
+        last_vote: row.last ? new Date(row.last).toISOString().slice(0,10) : null,
+        method: "1 vote per device per 24h"
+      });
+    }
   );
 });
 
+// Themes
 app.post("/api/themes",(req,res)=>{
   const { themes } = req.body;
   if(!Array.isArray(themes)) return res.status(400).end();
+
+  const cleanThemes = themes.filter(t => ALLOWED_THEMES.includes(t));
+  if(!cleanThemes.length) return res.status(400).end();
 
   const hash = makeHash(req);
   const now = Date.now();
   const stmt = db.prepare(
     "INSERT INTO themes (theme,hash,created_at) VALUES (?,?,?)"
   );
-  themes.forEach(t=>stmt.run(t,hash,now));
+
+  cleanThemes.forEach(t=>stmt.run(t,hash,now));
   stmt.finalize(()=>res.json({ok:true}));
 });
 
@@ -93,7 +163,7 @@ app.get("/api/themes",(req,res)=>{
 });
 
 /* ===============================
-   FRONTEND (HTML)
+   FRONTEND
 ================================ */
 app.get("/",(req,res)=>{
 res.send(`<!DOCTYPE html>
@@ -107,8 +177,11 @@ body{font-family:system-ui;margin:2rem;background:#f6f8fb}
 section{background:#fff;padding:1.5rem;border-radius:16px;margin-bottom:1.5rem}
 label{display:block;padding:.5rem}
 button{margin-top:1rem;padding:.6rem 1.2rem}
-.bar{height:14px;background:#2563eb;border-radius:999px}
+.bar{height:14px;border-radius:999px}
+.main{background:#2563eb}
+.neutral{background:#94a3b8}
 .small{font-size:.85rem;color:#555}
+#thanks{color:#2563eb;display:none}
 </style>
 </head>
 <body>
@@ -118,76 +191,69 @@ button{margin-top:1rem;padding:.6rem 1.2rem}
 
 <section>
 <form id="voteForm">
-<label><input type="radio" name="vote" value="CDU"> CDU</label>
-<label><input type="radio" name="vote" value="SPD"> SPD</label>
-<label><input type="radio" name="vote" value="FDP"> FDP</label>
-<label><input type="radio" name="vote" value="Die Linke"> Die Linke</label>
-<label><input type="radio" name="vote" value="EUK"> EUK</label>
-<label><input type="radio" name="vote" value="Freie Wähler"> Freie Wähler</label>
-<label><input type="radio" name="vote" value="WIK + FNK"> WIK + FNK</label>
-<label><input type="radio" name="vote" value="HAK"> HAK</label>
-<label><input type="radio" name="vote" value="Unentschlossen"> Unentschlossen</label>
+${ALLOWED_CHOICES.map(p=>`<label><input type="radio" name="vote" value="${p}"> ${p}</label>`).join("")}
 <button>Stimme abgeben</button>
+<p id="thanks" class="small">Danke für Ihre Teilnahme.</p>
 </form>
 </section>
 
 <section>
 <h2>Ergebnis</h2>
+<label class="small">Zeitraum:
+<select id="range">
+  <option value="all">Gesamt</option>
+  <option value="7d">Letzte 7 Tage</option>
+  <option value="30d">Letzte 30 Tage</option>
+</select>
+</label>
 <div id="results"></div>
 </section>
 
 <section>
-<h2>Themen</h2>
-<form id="themesForm">
-<label><input type="checkbox" value="Wohnraum"> Wohnraum</label>
-<label><input type="checkbox" value="Verkehr"> Verkehr</label>
-<label><input type="checkbox" value="Radwege"> Radwege</label>
-<label><input type="checkbox" value="ÖPNV"> ÖPNV</label>
-<button>Themen speichern</button>
-</form>
-<div id="themeResults" class="small"></div>
+<h2>Transparenz</h2>
+<div id="meta" class="small"></div>
 </section>
 
 <script>
-const parteien=["CDU","SPD","FDP","Die Linke","EUK","Freie Wähler","WIK + FNK","HAK","Unentschlossen"];
+const parteien=${JSON.stringify(ALLOWED_CHOICES)};
 
 document.getElementById("voteForm").onsubmit=async e=>{
   e.preventDefault();
   const c=document.querySelector("input[name=vote]:checked");
   if(!c) return;
   const r=await fetch("/api/vote",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({choice:c.value})});
-  if(r.status===429) alert("Schon abgestimmt");
+  if(r.status!==429){
+    document.getElementById("thanks").style.display="block";
+    setTimeout(()=>document.getElementById("thanks").style.display="none",2500);
+  }
   anzeigen();
 };
 
-document.getElementById("themesForm").onsubmit=async e=>{
-  e.preventDefault();
-  const themes=[...document.querySelectorAll("#themesForm input:checked")].map(x=>x.value);
-  await fetch("/api/themes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({themes})});
-  showThemes();
-};
+document.getElementById("range").onchange=anzeigen;
 
 async function anzeigen(){
-  const r=await fetch("/api/results");
-  const rows=await r.json();
+  const range=document.getElementById("range").value;
+  const rows=await fetch("/api/results?range="+range).then(r=>r.json());
   const map={};parteien.forEach(p=>map[p]=0);
   rows.forEach(r=>map[r.choice]=r.count);
+
   const sum=Object.values(map).reduce((a,b)=>a+b,0);
   const d=document.getElementById("results");d.innerHTML="";
   parteien.forEach(p=>{
     const v=map[p],pc=sum?(v/sum*100).toFixed(1):0;
-    d.innerHTML+=\`<div><b>\${p}: \${pc}% (\${v})</b><div class="bar" style="width:\${pc}%"></div></div>\`;
+    const cls=p==="Unentschlossen"?"neutral":"main";
+    d.innerHTML+=\`<div><b>\${p}: \${pc}% (\${v})</b><div class="bar \${cls}" style="width:\${pc}%"></div></div>\`;
   });
+
+  const m=await fetch("/api/meta").then(r=>r.json());
+  document.getElementById("meta").innerText=
+    "Stimmen: "+m.votes_total+
+    " · Erste: "+(m.first_vote||"-")+
+    " · Letzte: "+(m.last_vote||"-")+
+    " · Methode: "+m.method;
 }
 
-async function showThemes(){
-  const r=await fetch("/api/themes");
-  const rows=await r.json();
-  document.getElementById("themeResults").innerHTML=
-    rows.map(r=>\`\${r.theme}: \${r.count}\`).join("<br>");
-}
-
-anzeigen();showThemes();
+anzeigen();
 </script>
 </body>
 </html>`);
